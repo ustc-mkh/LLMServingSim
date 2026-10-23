@@ -89,10 +89,13 @@ def capture(runner, fire, catalog, iterations, *, forward_prefix=None, diagnosti
         raise ValueError('A positive timed-forward count is required')
     if not runner.vllm_config.model_config.enforce_eager:
         raise ValueError('Layer acquisition requires enforce_eager; graph components use their own contract')
-    result = collect(roots_from_runner(runner, sampler_adapter=wrap_sampler_for_profiling),
-                     iterations, lambda _index: fire(), catalog,
-                     forward_prefix=forward_prefix or FORWARD_PREFIX, scope_contexts=scope_contexts,
-                     expected_contexts=expected_contexts, context_diagnostic=diagnostic)
+    from .runner_boundaries import runner_boundaries
+    with runner_boundaries(runner):
+        result = collect(roots_from_runner(runner, sampler_adapter=wrap_sampler_for_profiling),
+                         iterations, lambda _index: fire(), catalog,
+                         forward_prefix=forward_prefix or FORWARD_PREFIX, scope_contexts=scope_contexts,
+                         expected_contexts=expected_contexts, context_diagnostic=diagnostic,
+                         forward_window=getattr(runner, '_profiling_forward_window', None))
     values = result['layer_us']
     if ((not values and not result.get('context_samples'))
             or any(not math.isfinite(v) or v <= 0 for v in values.values())):
@@ -123,7 +126,17 @@ def capture(runner, fire, catalog, iterations, *, forward_prefix=None, diagnosti
     # Category slices deliberately leave other model layers unbound. Only
     # work outside all module scopes is a runner-boundary gap here; full
     # catalog coverage provides its detailed, duration-conserving ledger.
+    if audit.get('explicit_auxiliary_counts') and not diagnostic:
+        raise ValueError('Auxiliary CUDA activity has no persisted simulation component; '
+                         'refusing to exclude it from saved timings')
     gaps = audit['unscoped_gpu'] + audit['outside_forward']
+    accepted = {tuple(row['identity']) for row in
+                audit.get('runner_approximation', {}).get('exclusions', [])}
+    unknown = [item for item in gaps if tuple(item['identity']) not in accepted]
+    if unknown and not diagnostic:
+        raise ValueError('CUDA activity outside declared module scopes; '
+                         'no reviewed runner boundary for: '
+                         + ', '.join(sorted({item['identity'][0] for item in unknown})))
     if gaps:
         names = frozenset(item['identity'][0] for item in gaps)
         reported = getattr(runner, '_profile_unscoped_names', frozenset())

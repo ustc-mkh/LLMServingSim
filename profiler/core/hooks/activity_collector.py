@@ -387,15 +387,15 @@ def extract(cpu, gpu, catalog, metadata, iterations,
         per_forward_activity_counts=[dict(values) for values in forward_counts],
         unique_cuda_activities=len(identities), missing_canonical=missing, zero_canonical=zero,
         invalid_forward_values=invalid_forward_values)
-    if strict_coverage and (gaps or unscoped or outside_forward or overlaps):
-        raise CoverageError('Unbound/unscoped GPU work or overlapping canonical claims are not certified', audit)
+    if strict_coverage and (gaps or unscoped or outside_forward or overlaps or aux_counts):
+        raise CoverageError('Unbound/unscoped/auxiliary GPU work or overlapping canonical claims are not certified', audit)
     if strict_model_coverage and (gaps or overlaps):
         raise CoverageError('Unbound model work or overlapping canonical claims are not certified', audit)
     if zero or invalid_forward_values or (require_complete and missing):
         raise CoverageError('Missing/zero canonical measurement', audit)
     return dict(**aggregate, per_forward=per_forward, activity_ledger=activity_ledger,
         per_forward_layers_us=[value['layer_us'] for value in per_forward], audit=audit,
-        complete=not (gaps or unscoped or outside_forward or overlaps or zero or (require_complete and missing)),
+        complete=not (gaps or unscoped or outside_forward or overlaps or aux_counts or zero or (require_complete and missing)),
         per_call=[dict(id=call['id'], parent=call['parent'], forward=call['forward'],
             class_name=call['class_name'], summary_name=call['summary_name'],
             scope_kind=call.get('scope_kind', 'module'),
@@ -605,6 +605,9 @@ def coverage_report(result):
         report['callable_audit'] = result['callable_audit']
     report['canonical_invocations'] = (result['context_source_invocations']
         if 'context_source_invocations' in result else canonical_invocation_counts(result))
+    approximation = result['audit'].get('runner_approximation')
+    if approximation is not None:
+        report['canonical_invocations']['runner_approximation'] = approximation
     if 'context_samples' in result:
         report['context_samples'] = result['context_samples']
         report['per_forward_context_samples'] = result['per_forward_context_samples']
@@ -617,7 +620,8 @@ Scopes = ScopedModules
 
 def collect(roots, iterations, callback, catalog, *, forward_prefix=FORWARD_PREFIX,
             strict_coverage=False, strict_model_coverage=False, require_complete=False,
-            return_events=False, scope_contexts=None, expected_contexts=None, context_diagnostic=False):
+            return_events=False, scope_contexts=None, expected_contexts=None, context_diagnostic=False,
+            forward_window=None):
     """Collect ``callback(index)`` eagerly without adding warmups or padding.
 
     ``roots`` is a mapping of existing modules, supplied by a runner adapter.
@@ -650,23 +654,59 @@ def collect(roots, iterations, callback, catalog, *, forward_prefix=FORWARD_PREF
             methods=contexts['methods'], forward_prefix=forward_prefix)
     else:
         scopes = RuntimeMethodScopes(roots, methods=contexts['methods'], forward_prefix=forward_prefix)
-    profiler = torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        record_shapes=False, with_stack=False, with_modules=False,
-        profile_memory=False, with_flops=False)
+    def new_profiler():
+        return torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False, with_stack=False, with_modules=False,
+            profile_memory=False, with_flops=False)
+
+    profiler = new_profiler() if forward_window is None else None
     configured = time.perf_counter()
+    native = []
     with scopes:
-        with profiler:
-            entered = time.perf_counter()
+        entered = time.perf_counter()
+        if forward_window is None:
+            with profiler:
+                for index in range(iterations):
+                    with scopes.forward(index):
+                        callback(index)
+                forwarded = time.perf_counter()
+            native.extend(profiler.profiler.kineto_results.events())
+        else:
+            # Conditioning/batch preparation executes before the callback enters
+            # this window. Each forward has a separate Kineto session; its global
+            # timestamps/correlation IDs and scope indices remain unmodified.
+            from contextlib import contextmanager
             for index in range(iterations):
-                with scopes.forward(index):
+                profiler = new_profiler()
+
+                @contextmanager
+                def window():
+                    with profiler:
+                        with scopes.forward(index):
+                            yield
+
+                with forward_window.bind(window):
                     callback(index)
+                native.extend(profiler.profiler.kineto_results.events())
             forwarded = time.perf_counter()
         closed = time.perf_counter()
     cleaned = time.perf_counter()
-    native = profiler.profiler.kineto_results.events()
     cpu = [event for event in native if event.device_type() == DeviceType.CPU]
     gpu = [event for event in native if event.device_type() == DeviceType.CUDA]
+    # Opt-in evidence only: retain launch provenance even when extraction or
+    # strict coverage subsequently fails. This does not change any ownership.
+    import os
+    provenance_dir = os.environ.get('PROFILER_CUDA_PROVENANCE_DIR')
+    if provenance_dir:
+        import json
+        from pathlib import Path
+        from uuid import uuid4
+        from .activity_provenance import launch_provenance
+        directory = Path(provenance_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f'{os.getpid()}-{uuid4().hex}.json'
+        path.write_text(json.dumps(launch_provenance(cpu, gpu)))
     metadata = scopes.metadata()
     result = extract_with_operators(cpu, gpu, catalog, metadata, iterations,
         contexts=contexts['operators'], forward_prefix=forward_prefix, strict_coverage=strict_coverage,
@@ -677,6 +717,20 @@ def collect(roots, iterations, callback, catalog, *, forward_prefix=FORWARD_PREF
         extract=finished-cleaned)
     result['collection_seconds'] = finished-started
     result.setdefault('metadata', metadata)
+    from .runner_boundaries import POLICY, classify_exclusions
+    if os.environ.get('PROFILER_RUNNER_POLICY') == POLICY:
+        from .activity_provenance import launch_provenance
+        evidence = classify_exclusions(result, launch_provenance(cpu, gpu),
+                                      os.environ['PROFILER_RUNNER_SOURCE_SHA256'])
+        audit_log = os.environ.get('PROFILER_RUNNER_AUDIT_LOG')
+        if audit_log:
+            import json
+            from pathlib import Path
+            from uuid import uuid4
+            directory = Path(audit_log)
+            directory.mkdir(parents=True, exist_ok=True)
+            # Unique files avoid multiprocessing append races and retain per-shot evidence.
+            (directory / f'{os.getpid()}-{uuid4().hex}.json').write_text(json.dumps(evidence))
     result['scope_contexts'] = contexts
     if (contexts['schema'] == 3 and selected) or expected_contexts is not None:
         from .callable_context import split_context_timings
